@@ -2,6 +2,11 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include "esp_mac.h"
+#endif
 #include "mbedtls/ecdh.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/entropy.h"
@@ -12,7 +17,8 @@
 //  Versión corregida. Cambios marcados con  // [FIX]
 // =====================================================================
 
-enum TipoMensaje { MSG_HELLO, MSG_PUBKEY, MSG_DATA };
+// MSG_DATA conserva el valor 2 para no cambiar el formato anterior.
+enum TipoMensaje { MSG_HELLO, MSG_PUBKEY, MSG_DATA, MSG_READY };
 
 // [FIX] Se añade campo 'nonce' para AES-CTR (nonce único por mensaje)
 struct __attribute__((packed)) PaqueteSeguro {
@@ -34,6 +40,9 @@ mbedtls_entropy_context entropy;
 uint8_t clave_aes_sesion[16];
 bool clave_establecida = false;
 bool soy_iniciador = false;
+bool configuracion_valida = false;
+bool peer_listo = false;
+bool saludo_seguro_enviado = false;
 
 // [FIX] Estado del handshake (API alto nivel: generamos la pública UNA vez)
 uint8_t mi_pub[64];
@@ -43,13 +52,16 @@ bool    mi_pub_enviada = false;
 // [FIX] Trabajo pesado se difiere del callback al loop() vía banderas
 volatile bool pendiente_enviar_pub = false;
 volatile bool pendiente_calcular   = false;
+volatile bool pendiente_enviar_ready = false;
+volatile bool pendiente_peer_ready   = false;
 uint8_t  pub_remota[64];
 size_t   pub_remota_len = 0;
 
 // --- Prototipos ---
-void inicializar_ecdh();
+bool inicializar_ecdh();
 void enviar_hello();
 void enviar_pubkey();
+void enviar_ready();
 void calcular_secreto();
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len);
 void procesar_paquete(const uint8_t *data, int len);
@@ -61,8 +73,20 @@ void setup() {
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
 
-    uint8_t macLocal[6];
-    WiFi.macAddress(macLocal);
+    uint8_t macLocal[6] = {0};
+
+    // WiFi.macAddress() puede entregar 00:00:00:00:00:00 durante el arranque
+    // en algunas combinaciones de placa/core. esp_read_mac() lee la MAC STA
+    // directamente desde ESP-IDF y no depende de ese estado transitorio.
+    esp_err_t macError = esp_read_mac(macLocal, ESP_MAC_WIFI_STA);
+    bool macEnCero = true;
+    for (int i = 0; i < 6; i++) macEnCero &= (macLocal[i] == 0);
+
+    // Respaldo por si el core no pudo obtenerla desde eFuse.
+    if (macError != ESP_OK || macEnCero) {
+        macError = esp_wifi_get_mac(WIFI_IF_STA, macLocal);
+    }
+
     Serial.print("MAC Local: ");
     for (int i = 0; i < 6; i++) {
         if (macLocal[i] < 0x10) Serial.print("0");
@@ -71,15 +95,25 @@ void setup() {
     }
     Serial.println();
 
-    // Rol automático según la MAC física
+    if (macError != ESP_OK) {
+        Serial.printf("ERROR: no se pudo leer la MAC STA (%d).\n", macError);
+        return;
+    }
+
+    // Rol automático según la MAC física. Una MAC desconocida ya no cae
+    // silenciosamente en RECEPTOR, porque eso ocultaba el problema real.
     if (memcmp(macLocal, MAC_PLACA_A, 6) == 0) {
         soy_iniciador = true;
         memcpy(macReceptor, MAC_PLACA_B, 6);
         Serial.println("Rol: TRANSMISOR (Iniciador) -> Placa B");
-    } else {
+    } else if (memcmp(macLocal, MAC_PLACA_B, 6) == 0) {
         soy_iniciador = false;
         memcpy(macReceptor, MAC_PLACA_A, 6);
         Serial.println("Rol: RECEPTOR (Respondedor) -> Placa A");
+    } else {
+        Serial.println("ERROR: la MAC local no coincide con MAC_PLACA_A ni MAC_PLACA_B.");
+        Serial.println("Actualiza esas dos constantes con las MAC impresas por cada placa.");
+        return;
     }
 
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -96,7 +130,8 @@ void setup() {
     if (esp_now_add_peer(&peerInfo) != ESP_OK) { Serial.println("Error add_peer"); return; }
     Serial.println("Peer OK.");
 
-    inicializar_ecdh();   // [FIX] genera nuestro par de claves UNA sola vez
+    if (!inicializar_ecdh()) return; // genera nuestro par de claves UNA sola vez
+    configuracion_valida = true;
 
     if (soy_iniciador) {
         delay(3000);
@@ -108,22 +143,44 @@ void setup() {
 void loop() {
     static uint32_t ultimoHello = 0;
 
+    if (!configuracion_valida) {
+        delay(1000);
+        return;
+    }
+
     if (pendiente_enviar_pub) { pendiente_enviar_pub = false; enviar_pubkey(); }
 
     if (pendiente_calcular) {
         pendiente_calcular = false;
-        calcular_secreto();
-        if (clave_establecida && soy_iniciador)
-            enviarSeguro("Canal seguro abierto. Handshake OK.");
+        if (!clave_establecida) calcular_secreto();
+        if (clave_establecida && !soy_iniciador) pendiente_enviar_ready = true;
     }
 
-    // Reintento de HELLO cada 1 s mientras no haya clave (paquetes ESP-NOW se pueden perder)
-    if (soy_iniciador && !clave_establecida && millis() - ultimoHello > 1000) {
+    if (pendiente_enviar_ready) {
+        pendiente_enviar_ready = false;
+        enviar_ready();
+    }
+
+    if (pendiente_peer_ready) {
+        pendiente_peer_ready = false;
+        if (soy_iniciador && clave_establecida) {
+            peer_listo = true;
+            if (!saludo_seguro_enviado) {
+                saludo_seguro_enviado = true;
+                enviarSeguro("Canal seguro abierto. Handshake OK.");
+            }
+        }
+    }
+
+    // Hasta recibir READY se reintenta HELLO: así también se recupera un
+    // READY perdido sin enviar DATA antes de que el receptor tenga la clave.
+    if (soy_iniciador && !peer_listo && millis() - ultimoHello > 1000) {
         ultimoHello = millis();
         enviar_hello();
     }
 
-    if (clave_establecida && Serial.available() > 0) {
+    bool canalListo = clave_establecida && (!soy_iniciador || peer_listo);
+    if (canalListo && Serial.available() > 0) {
         String msg = Serial.readStringUntil('\n');
         msg.trim();
         if (msg.length() > 0) enviarSeguro(msg.c_str());
@@ -131,27 +188,30 @@ void loop() {
 }
 
 // [FIX] API de alto nivel: setup + make_public una sola vez. Portable 2.x/3.x.
-void inicializar_ecdh() {
+bool inicializar_ecdh() {
     mbedtls_ecdh_init(&ecdh);
     mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_entropy_init(&entropy);
 
     const char *pers = "ecdh_esp32_grupo5";
-    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                          (const unsigned char *)pers, strlen(pers));
+    int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                                    (const unsigned char *)pers, strlen(pers));
+    if (ret != 0) { Serial.printf("Error ctr_drbg_seed: %d\n", ret); return false; }
 
-    int ret = mbedtls_ecdh_setup(&ecdh, MBEDTLS_ECP_DP_CURVE25519);
-    if (ret != 0) { Serial.printf("Error ecdh_setup: %d\n", ret); return; }
+    ret = mbedtls_ecdh_setup(&ecdh, MBEDTLS_ECP_DP_CURVE25519);
+    if (ret != 0) { Serial.printf("Error ecdh_setup: %d\n", ret); return false; }
 
     ret = mbedtls_ecdh_make_public(&ecdh, &mi_pub_len, mi_pub, sizeof(mi_pub),
                                    mbedtls_ctr_drbg_random, &ctr_drbg);
-    if (ret != 0) { Serial.printf("Error make_public: %d\n", ret); return; }
+    if (ret != 0) { Serial.printf("Error make_public: %d\n", ret); return false; }
 
-    Serial.println("[ECDH] Par de claves generado.");
+    Serial.printf("[ECDH] Par de claves generado. Publica serializada: %u bytes.\n",
+                  (unsigned)mi_pub_len);
+    return true;
 }
 
 void enviar_hello() {
-    PaqueteSeguro pkt;
+    PaqueteSeguro pkt = {};
     pkt.tipo = MSG_HELLO;
     pkt.longitud = 0;
     esp_now_send(macReceptor, (uint8_t *)&pkt, sizeof(pkt));
@@ -160,13 +220,21 @@ void enviar_hello() {
 
 // [FIX] Envía nuestra pública YA generada (no la regenera cada vez)
 void enviar_pubkey() {
-    PaqueteSeguro pkt;
+    PaqueteSeguro pkt = {};
     pkt.tipo = MSG_PUBKEY;
     pkt.longitud = mi_pub_len;
     memcpy(pkt.payload, mi_pub, mi_pub_len);
     esp_now_send(macReceptor, (uint8_t *)&pkt, sizeof(pkt));
     mi_pub_enviada = true;
     Serial.println("[Handshake] Mi clave publica enviada.");
+}
+
+void enviar_ready() {
+    PaqueteSeguro pkt = {};
+    pkt.tipo = MSG_READY;
+    pkt.longitud = 0;
+    esp_now_send(macReceptor, (uint8_t *)&pkt, sizeof(pkt));
+    Serial.println("[Handshake] READY enviado.");
 }
 
 // [FIX] Cálculo del secreto con API de alto nivel (read_public + calc_secret)
@@ -201,16 +269,47 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 }
 
 void procesar_paquete(const uint8_t *data, int len) {
-    PaqueteSeguro *pkt = (PaqueteSeguro *)data;
+    const PaqueteSeguro *pkt = (const PaqueteSeguro *)data;
 
     if (pkt->tipo == MSG_HELLO) {
-        Serial.println("[Handshake] HELLO recibido -> enviare mi publica.");
-        pendiente_enviar_pub = true;                 // el respondedor manda su pública
+        if (soy_iniciador) return;
+
+        if (clave_establecida) {
+            // El iniciador puede estar reintentando porque se perdió READY.
+            pendiente_enviar_ready = true;
+        } else {
+            Serial.println("[Handshake] HELLO recibido -> enviare mi publica.");
+            pendiente_enviar_pub = true;
+        }
     }
     else if (pkt->tipo == MSG_PUBKEY) {
         Serial.println("[Handshake] Publica remota recibida.");
+
+        if (clave_establecida) {
+            if (soy_iniciador && !peer_listo) {
+                // Puede haberse perdido nuestra PUBKEY: reenviarla permite que
+                // el respondedor termine el intercambio y conteste READY.
+                pendiente_enviar_pub = true;
+            } else if (!soy_iniciador) {
+                pendiente_enviar_ready = true;
+            }
+            return;
+        }
+
+        // make_public/read_public usan una clave Curve25519 serializada. En la
+        // API ECDH clásica de MbedTLS normalmente ocupa 33 bytes, no 32.
+        // Se compara con lo que realmente generó esta versión de la librería.
+        size_t longitudRecibida = pkt->longitud;
+        if (longitudRecibida == 0 ||
+            longitudRecibida > sizeof(pub_remota) ||
+            longitudRecibida != mi_pub_len) {
+            Serial.printf("[Handshake] Longitud publica invalida: %u; esperada: %u.\n",
+                          (unsigned)longitudRecibida, (unsigned)mi_pub_len);
+            return;
+        }
+
         // Guardamos la pública remota para procesarla en loop()
-        pub_remota_len = pkt->longitud;
+        pub_remota_len = longitudRecibida;
         memcpy(pub_remota, pkt->payload, pub_remota_len);
 
         // [FIX] Si soy el iniciador y aún no envié mi pública, mándala ahora.
@@ -218,6 +317,10 @@ void procesar_paquete(const uint8_t *data, int len) {
         if (soy_iniciador && !mi_pub_enviada) pendiente_enviar_pub = true;
 
         pendiente_calcular = true;                   // calcular secreto en loop()
+    }
+    else if (pkt->tipo == MSG_READY) {
+        pendiente_peer_ready = true;
+        Serial.println("[Handshake] READY recibido.");
     }
     else if (pkt->tipo == MSG_DATA) {
         if (!clave_establecida) {
@@ -267,9 +370,11 @@ void tuMecanismo_descifrar(const uint8_t *cifrado, uint8_t *claro, size_t len, c
 }
 
 void enviarSeguro(const char *mensaje) {
-    PaqueteSeguro pkt;
+    PaqueteSeguro pkt = {};
     pkt.tipo = MSG_DATA;
-    pkt.longitud = strlen(mensaje);
+    size_t longitud = strlen(mensaje);
+    if (longitud > sizeof(pkt.payload)) longitud = sizeof(pkt.payload);
+    pkt.longitud = longitud;
     tuMecanismo_cifrar((const uint8_t *)mensaje, pkt.payload, pkt.longitud, pkt.nonce);
     esp_now_send(macReceptor, (uint8_t *)&pkt, sizeof(pkt));
     Serial.printf("[TX] Enviado cifrado (%d bytes)\n", pkt.longitud);
